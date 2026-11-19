@@ -41,7 +41,8 @@ mkdir -p "$install_dir" "$config_dir" "$hermes_home/plugins/hermes-call"
 "$python_bin" -m venv "$install_dir/venv"
 "$install_dir/venv/bin/python" -m pip install 'setuptools>=75,<83' 'wheel>=0.45,<1'
 bash "$repo_dir/scripts/build-pjsip.sh" "$install_dir/venv" "$install_dir/build"
-"$install_dir/venv/bin/python" -m pip install "$repo_dir"
+"$install_dir/venv/bin/python" -m pip install --upgrade "$repo_dir"
+"$install_dir/venv/bin/python" -m pip install --force-reinstall --no-deps "$repo_dir"
 install -m 600 "$repo_dir/__init__.py" "$hermes_home/plugins/hermes-call/__init__.py"
 install -m 600 "$repo_dir/plugin.yaml" "$hermes_home/plugins/hermes-call/plugin.yaml"
 

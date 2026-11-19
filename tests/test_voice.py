@@ -85,6 +85,19 @@ def test_silence_never_sent_to_whisper(config, tmp_path):
     assert asyncio.run(Voice(config, None).transcribe(path)) == ""
 
 
+def test_short_utterance_with_trailing_silence_reaches_whisper(config, tmp_path):
+    class HTTP:
+        def post(self, url, **kwargs):
+            return SpeechResponse('{"text":"はい"}'.encode())
+
+    path = tmp_path / "short.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        # 0.3s at amplitude 250 + 2.0s silence -> whole-file mean energy < 100**2.
+        wav.writeframes(struct.pack("<h", 250) * 4800 + b"\0\0" * 32000)
+    assert asyncio.run(Voice(config, HTTP()).transcribe(path)) == "はい"
+
+
 def test_hermes_argv_preserves_call_session_and_cron(config, monkeypatch):
     mock = AsyncMock(return_value="こんにちは")
     monkeypatch.setattr("hermes_call.voice.run_process", mock)

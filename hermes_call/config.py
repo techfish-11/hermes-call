@@ -76,7 +76,9 @@ class Config:
         for domain in self.allowed_caller_domains:
             if not isinstance(domain, str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", domain):
                 raise ValueError("allowed_caller_domains must contain hostnames or IPv4 addresses")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", self.sip_username):
+        if not isinstance(self.sip_username, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,100}", self.sip_username
+        ):
             raise ValueError("invalid sip_username")
         for name in ("allowed_extensions", "allowed_callers"):
             values = getattr(self, name)
@@ -87,6 +89,8 @@ class Config:
         if not self.sip_peer_ips:
             raise ValueError("sip_peer_ips must contain trusted PBX addresses")
         for address in (*self.sip_peer_ips, self.sip_bind_address):
+            if not isinstance(address, str):
+                raise ValueError("SIP IPv4 addresses must be strings")
             ipaddress.IPv4Address(address)
         if self.sip_transport not in ("udp", "tcp", "tls"):
             raise ValueError("sip_transport must be udp, tcp or tls")
@@ -100,7 +104,7 @@ class Config:
             raise ValueError("hermes_command must be an argv list")
         if not Path(self.hermes_command[0]).is_absolute():
             raise ValueError("hermes_command executable must be absolute")
-        if not self.data_dir.is_absolute():
+        if not isinstance(self.data_dir, Path) or not self.data_dir.is_absolute():
             raise ValueError("data_dir must be absolute")
         for value in self.hermes_toolsets:
             if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
@@ -124,7 +128,10 @@ class Config:
         if self.api_port == self.sip_local_port or self.rtp_port % 2:
             raise ValueError("API/SIP ports must differ; RTP base port must be even")
         for name in ("stt_url", "tts_url"):
-            parsed = urlsplit(getattr(self, name))
+            url = getattr(self, name)
+            if not isinstance(url, str):
+                raise ValueError(f"{name} must be a URL string")
+            parsed = urlsplit(url)
             if (
                 parsed.scheme != "https"
                 or not parsed.hostname
@@ -132,11 +139,12 @@ class Config:
                 or parsed.password
                 or parsed.query
                 or parsed.fragment
-                or getattr(self, name).endswith("/")
+                or url.endswith("/")
             ):
                 raise ValueError(f"{name} must be HTTPS without credentials/query/trailing slash")
         for name in ("stt_model", "language"):
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", getattr(self, name)):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", value):
                 raise ValueError(f"invalid {name}")
 
     @classmethod
@@ -155,6 +163,8 @@ class Config:
                     raise ValueError(f"{name} must be a list")
                 raw[name] = tuple(raw[name])
         if "data_dir" in raw:
+            if not isinstance(raw["data_dir"], str):
+                raise ValueError("data_dir must be a path string")
             raw["data_dir"] = Path(raw["data_dir"])
         try:
             return cls(**raw)

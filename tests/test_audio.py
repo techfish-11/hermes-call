@@ -46,3 +46,22 @@ def test_playback_completes_only_when_native_clock_consumes():
         assert buffer.outgoing == b""
 
     asyncio.run(scenario())
+
+
+def test_listen_trims_pre_speech_silence_and_keeps_short_utterance():
+    async def scenario():
+        buffer = AudioBuffer()
+        listener = asyncio.create_task(buffer.listen(limit_seconds=2, silence_seconds=0.06))
+        await asyncio.sleep(0)
+        # Feed 1 second (32,000 bytes) of pre-speech silence in 20ms chunks.
+        for _ in range(50):
+            buffer.receive(b"\0" * 640)
+        utterance = struct.pack("<h", 300) * 320
+        buffer.receive(utterance)
+        buffer.receive(b"\0" * 1920)
+        result = await asyncio.wait_for(listener, 1)
+        # Only the 0.3s pre-roll (9,600 bytes) + utterance (640) + trailing silence (1,920) remain.
+        assert len(result) == BYTES_PER_SECOND * 3 // 10 + len(utterance) + 1920
+        assert utterance in result
+
+    asyncio.run(scenario())

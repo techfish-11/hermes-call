@@ -120,6 +120,61 @@ def test_chat_binding_api_and_outbound_chat_selection(config, tmp_path):
             assert store.get("f" * 32)["chat_ref"] == "chat-main"
             assert (await client.delete(path, headers=headers)).status == 200
             assert store.binding("1001") is None
+            # Retrying the same request_id after unbinding/rebinding stays idempotent.
+            retried = await dialer.dial(data)
+            assert retried["id"] == "f" * 32
+            assert retried["chat_ref"] == "chat-main"
+            store.bind("1001", "chat-other")
+            assert (await dialer.dial(data))["chat_ref"] == "chat-main"
+            with pytest.raises(ValueError, match="different"):
+                await dialer.dial({**data, "chat_ref": "other-origin"})
+            with pytest.raises(ValueError, match="different"):
+                await dialer.dial({**data, "message": "changed"})
+
+            # Unbound call must also reject retries with a different explicit chat_ref.
+            sip.busy = False
+            store.unbind("1001")
+            unbound = {
+                "extension": "1001",
+                "message": "hello",
+                "request_id": "1" * 32,
+                "chat_ref": "chat-a",
+            }
+            await dialer.dial(unbound)
+            await asyncio.gather(*list(dialer.tasks))
+            assert (await dialer.dial(unbound))["chat_ref"] == "chat-a"
+            with pytest.raises(ValueError, match="different"):
+                await dialer.dial({**unbound, "chat_ref": "chat-b"})
+            with pytest.raises(ValueError, match="different"):
+                await dialer.dial({**unbound, "chat_ref": None})
         await dialer.close()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_migrated_bound_call_retry_succeeds_via_dialer(config, tmp_path):
+    import sqlite3
+
+    async def scenario():
+        path = tmp_path / "legacy.sqlite"
+        with sqlite3.connect(path) as db:
+            db.execute("""CREATE TABLE calls (
+                id TEXT PRIMARY KEY, extension TEXT NOT NULL, message TEXT NOT NULL,
+                created REAL NOT NULL, updated REAL NOT NULL,
+                state TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', chat_ref TEXT)""")
+            db.execute(
+                "INSERT INTO calls VALUES (?,?,?,?,?,?,?,?)",
+                ("9" * 32, "1001", "hello", 1, 1, "completed", "", "bound-chat"),
+            )
+        store = Store(path)
+        sip = FakeSIP()
+        dialer = Dialer(config, store, sip, AsyncMock())
+        # Retry with omitted chat_ref (as in a cron or unbound retry) must return the existing row.
+        retried = await dialer.dial(
+            {"extension": "1001", "message": "hello", "request_id": "9" * 32}
+        )
+        assert retried["id"] == "9" * 32
+        assert retried["chat_ref"] == "bound-chat"
+        assert sip.requests == []
 
     asyncio.run(scenario())

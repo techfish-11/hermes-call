@@ -93,3 +93,26 @@ def test_real_child_stream_is_decoded_and_exit_status_checked():
                 [sys.executable, "-c", script + ";raise SystemExit(3)"], 5, stream_json=True
             )
         )
+
+
+def test_large_tool_event_line_above_256kb_is_accepted_within_stream_limit():
+    script = (
+        "import json; "
+        "print(json.dumps({'type':'tool_result','name':'web','output':'x'*350000}),flush=True); "
+        "print(json.dumps({'type':'result','exit_code':0,'text':'ok'}),flush=True)"
+    )
+    events = []
+    result = asyncio.run(
+        run_process([sys.executable, "-c", script], 5, stream_json=True, on_event=events.append)
+    )
+    assert result == "ok"
+    assert events == [{"type": "tool_result", "name": "web", "is_error": False}]
+
+
+def test_oversized_single_line_above_stream_limit_raises_runtime_error():
+    script = (
+        "import json; "
+        "print(json.dumps({'type':'tool_result','output':'x'*(2*1024*1024+1024)}),flush=True)"
+    )
+    with pytest.raises(RuntimeError, match="exceeded limit"):
+        asyncio.run(run_process([sys.executable, "-c", script], 5, stream_json=True))

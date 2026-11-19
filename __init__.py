@@ -49,6 +49,21 @@ def _request(method: str, endpoint: str, payload: dict | None = None) -> str:
         return json.dumps(result, ensure_ascii=False)
 
 
+def _http_error_message(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read(4096) if getattr(exc, "fp", None) is not None else b""
+        if raw:
+            body = json.loads(raw)
+            detail = body.get("error") if isinstance(body, dict) else None
+            if isinstance(detail, str) and 0 < len(detail.strip()) <= 300:
+                return detail.strip()
+    except Exception:
+        pass
+    finally:
+        exc.close()
+    return "telephone service rejected the request"
+
+
 def _safe_handler(func):
     @functools.wraps(func)
     def wrapped(args: dict, **kwargs) -> str:
@@ -57,21 +72,26 @@ def _safe_handler(func):
                 raise ValueError("arguments must be an object")
             return func(args, **kwargs)
         except urllib.error.HTTPError as exc:
-            return json.dumps(
-                {
-                    "error": "telephone service rejected the request",
-                    "status": exc.code,
-                    "retry": "reuse the same request_id",
-                }
-            )
+            payload: dict[str, str | int] = {
+                "error": _http_error_message(exc),
+                "status": exc.code,
+            }
+            if func.__name__ == "dial" and (exc.code == 409 or exc.code >= 500):
+                payload["retry"] = "reuse the same request_id"
+            return json.dumps(payload, ensure_ascii=False)
         except ValueError as exc:
-            return json.dumps({"error": str(exc)})
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
         except Exception as exc:
             log.error("hermes-call tool failed (%s)", type(exc).__name__)
+            retry = (
+                "check service; reuse the same request_id"
+                if func.__name__ == "dial"
+                else "check service"
+            )
             return json.dumps(
                 {
                     "error": "telephone service unavailable or misconfigured",
-                    "retry": "check service; reuse the same request_id",
+                    "retry": retry,
                 }
             )
 

@@ -20,10 +20,39 @@ from .store import new_id
 log = logging.getLogger(__name__)
 
 
+_ADDR_SPEC = re.compile(
+    r"sips?:([0-9]{1,12})@([A-Za-z0-9.-]+)(?::[0-9]+)?(?:;[^\s>]*)?\Z",
+    re.IGNORECASE,
+)
+
+
+def _extract_name_addr(text: str) -> str | None:
+    quoted = escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quoted:
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif not quoted and char == "<":
+            end = text.find(">", index + 1)
+            if end < 0:
+                return None
+            rest = text[end + 1 :].lstrip()
+            if rest and not rest.startswith(";"):
+                return None
+            return text[index + 1 : end].strip()
+    return None
+
+
 def caller_identity(uri: str) -> tuple[str | None, str | None]:
-    match = re.search(
-        r"(?:^|<)sips?:([0-9]{1,12})@([A-Za-z0-9.-]+)(?::[0-9]+)?(?:[;>]|$)", uri, re.IGNORECASE
-    )
+    text = uri.strip()
+    if (addr := _extract_name_addr(text)) is None:
+        if "<" in text or ">" in text:
+            return (None, None)
+        addr = text
+    match = _ADDR_SPEC.fullmatch(addr)
     return (match[1], match[2].lower()) if match else (None, None)
 
 
@@ -162,6 +191,18 @@ class CallSession:
     chat_ref: str | None = None
     failure_reason: str | None = None
     media_connected: bool = False
+    release_on_disconnect: bool = False
+
+
+def _abort_session(session: CallSession | None, reason: str) -> None:
+    """Stop audio and unblock all waiters when a native SIP callback fails."""
+    if session is None:
+        return
+    session.failure_reason = reason
+    session.audio.stop()
+    session.disconnected.set()
+    session.ready.set()
+    session.answered.set()
 
 
 class SipClient:
@@ -236,16 +277,13 @@ class SipClient:
                             session.disconnected.set()
                             session.ready.set()  # Wake an unanswered/media wait immediately.
                             session.answered.set()
+                            if session.release_on_disconnect:
+                                owner.release(session)
                         # Keep SWIG objects alive until the native callback returns.
                         loop.call_soon(owner.native_calls.pop, self.getId(), None)
                 except Exception as exc:
                     log.error("SIP state callback failed (%s)", native_error(exc))
-                    if self.session:
-                        self.session.failure_reason = "state_callback_error"
-                        self.session.audio.stop()
-                        self.session.disconnected.set()
-                        self.session.ready.set()
-                        self.session.answered.set()
+                    _abort_session(self.session, "state_callback_error")
 
             def onCallMediaState(self, prm):
                 self.connect_media()
@@ -283,11 +321,7 @@ class SipClient:
                         self.session.media_connected = False
                 except Exception as exc:
                     log.error("SIP media callback failed (%s)", native_error(exc))
-                    self.session.failure_reason = "media_callback_error"
-                    self.session.audio.stop()
-                    self.session.disconnected.set()
-                    self.session.ready.set()
-                    self.session.answered.set()
+                    _abort_session(self.session, "media_callback_error")
 
         class Account(pj.Account):
             def onRegState(self, prm):
@@ -337,11 +371,7 @@ class SipClient:
                     call.answer(op)
                 except Exception as exc:
                     log.error("SIP incoming callback failed (%s)", native_error(exc))
-                    if call.session:
-                        call.session.failure_reason = "incoming_callback_error"
-                        call.session.disconnected.set()
-                        call.session.ready.set()
-                        call.session.answered.set()
+                    _abort_session(call.session, "incoming_callback_error")
                     op = pj.CallOpParam()
                     op.statusCode = 500
                     try:
@@ -429,23 +459,44 @@ class SipClient:
         call = self.call_class(self.account, session=session)
         session.native = call
         self.sessions[call_id] = session
+        on_call_attempted = False
         notified = False
         try:
             op = self.pj.CallOpParam(True)
             op.opt.audioCount, op.opt.videoCount = 1, 0
             scheme = "sips" if self.config.sip_transport == "tls" else "sip"
             call.makeCall(f"{scheme}:{extension}@{self.config.sip_domain}", op)
-            self.native_calls[call.getId()] = call
+            native_id = call.getId()
+            if native_id != self.pj.PJSUA_INVALID_ID:
+                self.native_calls[native_id] = call
+            on_call_attempted = True
             self.on_call(session)
             notified = True
             return session
         except Exception:
-            # Keep ownership and the busy slot until bounded conversation cleanup runs.
             native_id = call.getId()
-            if native_id != self.pj.PJSUA_INVALID_ID:
-                self.native_calls[native_id] = call
+            if native_id == self.pj.PJSUA_INVALID_ID:
+                self.release(session)
+                raise
+            self.native_calls[native_id] = call
+            if not on_call_attempted:
+                # Keep ownership and the busy slot until bounded conversation cleanup runs.
+                try:
+                    self.on_call(session)
+                    notified = True
+                except Exception as callback_error:
+                    log.error("SIP failed dial handoff failed (%s)", native_error(callback_error))
             if not notified:
-                self.on_call(session)
+                # Handoff failed: attempt hangup, and keep the session/busy slot
+                # until native disconnect is confirmed.
+                session.audio.stop()
+                session.release_on_disconnect = True
+                try:
+                    self.hangup(session)
+                except Exception as hangup_error:
+                    log.warning("SIP failed dial hangup failed (%s)", native_error(hangup_error))
+                if session.native_disconnected:
+                    self.release(session)
             raise
 
     def hangup(self, session: CallSession) -> None:

@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import signal
-import struct
+import sys
 import wave
+from array import array
 from collections.abc import Callable
 from pathlib import Path
 
@@ -42,6 +43,25 @@ async def read_json_object(response, limit: int, stage: str) -> dict:
     return value
 
 
+def has_speech_energy(pcm: bytes, threshold: int = 100, block_samples: int = 320) -> bool:
+    """Return True if any 20ms-sized block exceeds the silence energy floor."""
+    if not pcm:
+        return False
+    if len(pcm) % 2:
+        raise ValueError("expected PCM16 audio")
+    samples = array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    cutoff = threshold * threshold
+    divisor = min(len(samples), block_samples)
+    for start in range(0, len(samples), block_samples):
+        block = samples[start : start + block_samples]
+        if sum(sample * sample for sample in block) / max(len(block), divisor) >= cutoff:
+            return True
+    return False
+
+
 def split_text(text: str, limit: int) -> list[str]:
     """Split without dropping words when the public service limits text length."""
     chunks = []
@@ -55,6 +75,9 @@ def split_text(text: str, limit: int) -> list[str]:
         if chunk:
             chunks.append(chunk)
     return chunks
+
+
+AGENT_STREAM_LIMIT = 2 * 1024 * 1024
 
 
 async def run_process(
@@ -73,7 +96,7 @@ async def run_process(
         stdin=asyncio.subprocess.DEVNULL,
         env=env,
         start_new_session=os.name == "posix",
-        limit=256 * 1024,
+        limit=AGENT_STREAM_LIMIT if stream_json else 256 * 1024,
     )
 
     async def read_output() -> bytes:
@@ -110,9 +133,15 @@ async def read_agent_events(
     """Consume the documented Hermes JSONL protocol without retaining tool input/output."""
     total = 0
     final = None
-    while line := await reader.readline():
+    while True:
+        try:
+            line = await reader.readline()
+        except ValueError:
+            raise RuntimeError("Hermes event stream exceeded limit") from None
+        if not line:
+            break
         total += len(line)
-        if total > 2 * 1024 * 1024:
+        if total > AGENT_STREAM_LIMIT:
             raise RuntimeError("Hermes event stream exceeded limit")
         try:
             event = json.loads(line)
@@ -180,10 +209,7 @@ class Voice:
             if wav.getsampwidth() != 2 or wav.getnchannels() != 1:
                 raise RuntimeError("expected mono PCM16 recording")
             pcm = wav.readframes(wav.getnframes())
-        if not pcm:
-            return ""
-        energy = sum(sample[0] ** 2 for sample in struct.iter_unpack("<h", pcm))
-        if energy / (len(pcm) // 2) < 100**2:
+        if not pcm or not has_speech_energy(pcm):
             return ""
         form = aiohttp.FormData()
         form.add_field("model", c.stt_model)

@@ -8,7 +8,9 @@ from hermes_call.sip import (
     CallSession,
     MediaLink,
     SipClient,
+    _abort_session,
     caller_extension,
+    caller_identity,
     incoming_decision,
     media_snapshot,
     native_error,
@@ -25,10 +27,22 @@ from hermes_call.sip import (
         ("sip:1001@evil.example.com", None),
         ("sip:1001%40evil@pbx.example.com", None),
         ("sip:1001@pbx.example.com.evil", None),
+        ('"<sip:1001@pbx.example.com>" <sip:9999@evil.example.com>', None),
+        ('"Escaped \\"<sip:1001@pbx.example.com>" <sip:9999@pbx.example.com>', "9999"),
+        ('"<sip:1001@pbx.example.com>" <sip:9999@pbx.example.com>;tag=abc', "9999"),
+        ('"Name" <sip:1001@pbx.example.com> <sip:9999@evil.example>', None),
     ],
 )
 def test_caller_uri_domain_validation(uri, expected):
     assert caller_extension(uri, "pbx.example.com") == expected
+
+
+def test_caller_identity_ignores_spoofed_display_name_uri():
+    assert caller_identity('"<sip:1001@pbx.example.com>" <sip:9999@evil.example>') == (
+        "9999",
+        "evil.example",
+    )
+    assert caller_identity('"unclosed <sip:1001@pbx.example.com>') == (None, None)
 
 
 def test_source_address_validation():
@@ -162,3 +176,143 @@ def test_unexpected_native_disconnect_error_is_not_swallowed():
     with pytest.raises(NativeMediaError):
         link.connect(new)
     new.startTransmit.assert_not_called()
+
+
+def test_abort_session_stops_audio_and_wakes_waiters_safely():
+    _abort_session(None, "ignored")
+    session = CallSession("a" * 32, "1001", "hello", False)
+    _abort_session(session, "incoming_callback_error")
+    assert session.failure_reason == "incoming_callback_error"
+    assert session.audio.ended.is_set()
+    assert session.disconnected.is_set()
+    assert session.ready.is_set()
+    assert session.answered.is_set()
+
+
+def test_dial_failure_with_invalid_native_id_releases_line_immediately(config):
+    on_call = Mock()
+    sip = SipClient(config, on_call)
+    sip.registered = True
+    sip.pj = SimpleNamespace(
+        PJSUA_INVALID_ID=-1,
+        CallOpParam=lambda init=False: SimpleNamespace(opt=SimpleNamespace()),
+    )
+    fake_call = Mock()
+    fake_call.getId.return_value = -1
+    fake_call.makeCall.side_effect = RuntimeError("makeCall failed")
+    sip.call_class = Mock(return_value=fake_call)
+
+    with pytest.raises(RuntimeError, match="makeCall failed"):
+        sip.dial("a" * 32, "1001", "hello", b"\0\0")
+
+    assert not sip.busy
+    assert sip.native_calls == {}
+    assert fake_call.session is None
+    on_call.assert_not_called()
+    fake_call.hangup.assert_not_called()
+
+
+def test_dial_failure_after_native_id_hands_off_to_on_call_and_keeps_busy(config):
+    handed_off = []
+    sip = SipClient(config, handed_off.append)
+    sip.registered = True
+    sip.pj = SimpleNamespace(
+        PJSUA_INVALID_ID=-1,
+        CallOpParam=lambda init=False: SimpleNamespace(opt=SimpleNamespace()),
+    )
+    fake_call = Mock()
+    fake_call.getId.return_value = 7
+    fake_call.makeCall.side_effect = RuntimeError("makeCall failed after id")
+
+    def make_call_wrapper(_account, session=None):
+        fake_call.session = session
+        return fake_call
+
+    sip.call_class = Mock(side_effect=make_call_wrapper)
+
+    with pytest.raises(RuntimeError, match="makeCall failed after id"):
+        sip.dial("a" * 32, "1001", "hello", b"\0\0")
+
+    assert sip.busy
+    assert sip.native_calls == {7: fake_call}
+    assert len(handed_off) == 1
+    assert handed_off[0].id == "a" * 32
+    assert fake_call.session is handed_off[0]
+    fake_call.hangup.assert_not_called()
+
+
+def test_dial_failure_keeps_session_and_busy_when_handoff_and_hangup_fail(config):
+    on_call = Mock(side_effect=RuntimeError("on_call failed"))
+    sip = SipClient(config, on_call)
+    sip.registered = True
+    sip.pj = SimpleNamespace(
+        PJSUA_INVALID_ID=-1,
+        CallOpParam=lambda init=False: SimpleNamespace(opt=SimpleNamespace()),
+    )
+    fake_call = Mock()
+    fake_call.getId.return_value = 7
+    fake_call.makeCall.side_effect = RuntimeError("makeCall failed after id")
+    fake_call.hangup.side_effect = RuntimeError("hangup failed")
+
+    def make_call_wrapper(_account, session=None):
+        fake_call.session = session
+        return fake_call
+
+    sip.call_class = Mock(side_effect=make_call_wrapper)
+
+    with pytest.raises(RuntimeError, match="makeCall failed after id"):
+        sip.dial("a" * 32, "1001", "hello", b"\0\0")
+
+    assert sip.busy
+    assert "a" * 32 in sip.sessions
+    assert sip.native_calls == {7: fake_call}
+    assert fake_call.session is sip.sessions["a" * 32]
+    assert fake_call.session.release_on_disconnect is True
+    on_call.assert_called_once()
+    fake_call.hangup.assert_called_once()
+
+
+def test_dial_callback_failure_releases_only_after_native_disconnect_confirmed(config):
+    on_call = Mock(side_effect=RuntimeError("on_call failed"))
+    sip = SipClient(config, on_call)
+    sip.registered = True
+    sip.pj = SimpleNamespace(
+        PJSUA_INVALID_ID=-1,
+        CallOpParam=lambda init=False: SimpleNamespace(opt=SimpleNamespace()),
+    )
+    fake_call = Mock()
+    fake_call.getId.return_value = 7
+
+    def make_call_wrapper(_account, session=None):
+        fake_call.session = session
+        return fake_call
+
+    sip.call_class = Mock(side_effect=make_call_wrapper)
+
+    # Without confirmed native disconnect, session and busy stay held.
+    with pytest.raises(RuntimeError, match="on_call failed"):
+        sip.dial("a" * 32, "1001", "hello", b"\0\0")
+
+    assert sip.busy
+    assert sip.native_calls == {7: fake_call}
+    assert fake_call.session is sip.sessions["a" * 32]
+    assert fake_call.session.release_on_disconnect is True
+    on_call.assert_called_once()
+    fake_call.hangup.assert_called_once()
+
+    # When hangup confirms native disconnect synchronously, session is released immediately.
+    sip.release(sip.sessions["a" * 32])
+    on_call.reset_mock()
+    fake_call.hangup.reset_mock()
+
+    def sync_hangup(_op):
+        fake_call.session.native_disconnected = True
+
+    fake_call.hangup.side_effect = sync_hangup
+    with pytest.raises(RuntimeError, match="on_call failed"):
+        sip.dial("b" * 32, "1001", "hello", b"\0\0")
+
+    assert not sip.busy
+    assert fake_call.session is None
+    on_call.assert_called_once()
+    fake_call.hangup.assert_called_once()

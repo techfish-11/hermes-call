@@ -29,11 +29,13 @@ class Dialer:
 
     async def dial(self, data: dict) -> dict:
         call = validate_call(data, self.config.allowed_extensions)
-        call["chat_ref"] = self.store.binding(call["extension"]) or call["chat_ref"]
-        # Reserve the single line atomically before asynchronous TTS preparation.
+        call["request_chat_ref"] = call["chat_ref"]
+        # Check idempotency against the original request parameters before binding resolution.
         if self.store.get(call["id"]):
             result, _ = self.store.add(call)
             return result
+        call["chat_ref"] = self.store.binding(call["extension"]) or call["chat_ref"]
+        # Reserve the single line atomically before asynchronous TTS preparation.
         if not self.sip.registered:
             raise web.HTTPServiceUnavailable(
                 text='{"error":"SIP account is not registered"}', content_type="application/json"
@@ -154,7 +156,7 @@ async def serve(config: Config) -> None:
     import fcntl
 
     config.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (config.data_dir / "service.lock").open("w") as lock:
+    with (config.data_dir / "service.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         media = config.data_dir / "media"
         media.mkdir(mode=0o700, exist_ok=True)

@@ -102,11 +102,19 @@ class AudioBuffer:
             self.overflow = False
             self.capture = True
         audio = bytearray()
+        preroll = bytearray()
+        max_bytes = int(BYTES_PER_SECOND * limit_seconds) & ~1
+        preroll_limit = min(BYTES_PER_SECOND * 3 // 10, max_bytes) & ~1
         silence = 0
         started = time.monotonic()
+        speech_started: float | None = None
         voiced = False
         try:
-            while time.monotonic() - started < limit_seconds:
+            while (
+                (time.monotonic() - speech_started < limit_seconds)
+                if speech_started is not None
+                else (time.monotonic() - started < min(wait_seconds, limit_seconds))
+            ):
                 if self.ended.is_set():
                     raise ConnectionError("call disconnected")
                 with self.lock:
@@ -118,15 +126,28 @@ class AudioBuffer:
                 for chunk in chunks:
                     if len(chunk) % 2:
                         raise RuntimeError("invalid PCM frame")
-                    if len(audio) + len(chunk) > BYTES_PER_SECOND * limit_seconds:
-                        return bytes(audio) if voiced else b""
-                    audio.extend(chunk)
                     energy = sum(x[0] ** 2 for x in struct.iter_unpack("<h", chunk))
-                    if chunk and energy / (len(chunk) // 2) >= 200**2:
+                    is_voiced = bool(chunk) and energy / (len(chunk) // 2) >= 200**2
+                    if not voiced:
+                        if not is_voiced:
+                            preroll.extend(chunk)
+                            if len(preroll) > preroll_limit:
+                                del preroll[: len(preroll) - preroll_limit]
+                            continue
                         voiced, silence = True, 0
+                        speech_started = time.monotonic()
+                        keep = min(len(preroll), max(0, (max_bytes - len(chunk)) & ~1))
+                        if keep:
+                            audio.extend(preroll[-keep:])
+                        preroll.clear()
+                    if len(audio) + len(chunk) > max_bytes:
+                        return bytes(audio)
+                    audio.extend(chunk)
+                    if is_voiced:
+                        silence = 0
                     else:
                         silence += len(chunk)
-                    if voiced and silence >= BYTES_PER_SECOND * silence_seconds:
+                    if silence >= BYTES_PER_SECOND * silence_seconds:
                         return bytes(audio)
                 if not voiced and time.monotonic() - started >= wait_seconds:
                     return b""

@@ -1,5 +1,7 @@
 import importlib.util
+import io
 import json
+import urllib.error
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -64,3 +66,44 @@ def test_dial_carries_origin_without_mutating_tool_arguments(monkeypatch):
     module.dial(args, conversation_id="chat-source")
     assert "chat_ref" not in args
     assert request.call_args.args[2]["chat_ref"] == "chat-source"
+
+
+def test_http_errors_surface_service_error_and_retry_hint_appropriately(monkeypatch):
+    module = plugin()
+
+    def http_error(code, body):
+        fp = io.BytesIO(body) if body is not None else None
+        return urllib.error.HTTPError("http://127.0.0.1:8765/calls", code, "err", {}, fp)
+
+    dial_args = {"extension": "1001", "message": "hello", "request_id": "a" * 32}
+
+    monkeypatch.setattr(
+        module,
+        "_request",
+        Mock(side_effect=http_error(400, b'{"error":"extension is not allowed"}')),
+    )
+    bad = json.loads(module.dial(dial_args))
+    assert bad == {"error": "extension is not allowed", "status": 400}
+
+    monkeypatch.setattr(
+        module,
+        "_request",
+        Mock(side_effect=http_error(409, b'{"error":"telephone is busy"}')),
+    )
+    busy = json.loads(module.dial(dial_args))
+    assert busy == {
+        "error": "telephone is busy",
+        "status": 409,
+        "retry": "reuse the same request_id",
+    }
+
+    monkeypatch.setattr(module, "_request", Mock(side_effect=http_error(503, None)))
+    link_err = json.loads(module.link({"extension": "1001", "action": "status"}))
+    assert link_err == {"error": "telephone service rejected the request", "status": 503}
+
+    monkeypatch.setattr(module, "_request", Mock(side_effect=OSError("down")))
+    status_err = json.loads(module.status({}))
+    assert status_err == {
+        "error": "telephone service unavailable or misconfigured",
+        "retry": "check service",
+    }
